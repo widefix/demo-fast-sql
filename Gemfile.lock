@@ -66,6 +66,7 @@ GEM
       i18n (>= 1.6, < 2)
       minitest (>= 5.1)
       tzinfo (~> 2.0)
+    benchmark-ips (2.12.0)
     bindex (0.8.1)
     bootsnap (1.16.0)
       msgpack (~> 1.2)
@@ -163,6 +164,7 @@ PLATFORMS
   x86_64-darwin-20
 
 DEPENDENCIES
+  benchmark-ips
   bootsnap
   debug
   pg (~> 1.1)
