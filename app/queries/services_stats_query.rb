@@ -21,7 +21,7 @@ class ServicesStatsQuery
       order by count(p.id) desc, s.category_id asc
   SQL
 
-  SQL2 = <<~SQL
+  SQL_GPT = <<~SQL
     SELECT
       s.category_id AS "categoryId",
       pc.name AS "categoryName",
@@ -43,22 +43,39 @@ class ServicesStatsQuery
       COUNT(p.id) DESC, s.category_id ASC;
   SQL
 
-  SQL3 = <<~SQL
-    SELECT s.category_id AS categoryId,
-      c1.name AS categoryName,
-      c2.name AS subcategoryName,
-      COUNT(DISTINCT p1.id) AS completedProjectsCount,
-      COUNT(DISTINCT r1.id) AS ratingsCount,
-      ROUND(AVG(r1.rating), 1) AS ratingsAverage
+  SQL_GPT_NEW = <<~SQL
+    -- Get average ratings and count for each service
+    WITH rating_summary AS (
+      SELECT p.category_id, COUNT(r.id) AS ratings_count, COALESCE(AVG(r.rating), 0) AS ratings_average
+      FROM ratings r
+      INNER JOIN projects p ON p.id = r.project_id
+      WHERE r.reviewee_id = :user_id
+      GROUP BY p.category_id
+    ),
+
+    -- Get completed projects count for each service
+    completed_projects AS (
+      SELECT category_id, COUNT(*) AS completed_projects_count
+      FROM projects
+      WHERE vendor_id = :user_id AND status = 'Complete'
+      GROUP BY category_id
+    )
+
+    -- Combine the results
+    SELECT
+      s.category_id,
+      c.name AS category_name,
+      p.name AS subcategory_name,
+      COALESCE(cp.completed_projects_count, 0) AS completed_projects_count,
+      COALESCE(rs.ratings_count, 0) AS ratings_count,
+      ROUND(COALESCE(rs.ratings_average, 0), 1) AS ratings_average
     FROM services s
-    JOIN users u ON s.user_id = u.id
-    JOIN categories c1 ON c1.id = s.category_id
-    JOIN categories c2 ON c2.id = c1.parent_id
-    LEFT JOIN projects p1 ON p1.vendor_id = u.id AND p1.status = 'Complete' AND p1.category_id = s.category_id
-    LEFT JOIN ratings r1 ON r1.reviewee_id = u.id AND r1.project_id = p1.id
-    WHERE s.status = 'approved' AND s.active = true AND u.id = :userId
-    GROUP BY s.category_id, c1.name, c2.name
-    ORDER BY completedProjectsCount DESC;
+    JOIN categories c ON c.id = s.category_id
+    JOIN categories p ON p.id = c.parent_id
+    LEFT JOIN rating_summary rs ON rs.category_id = s.category_id
+    LEFT JOIN completed_projects cp ON cp.category_id = s.category_id
+    WHERE s.user_id = :user_id AND s.status = 'approved' AND s.active = true
+    ORDER BY completed_projects_count DESC;
   SQL
 
   attr_accessor :user
@@ -104,117 +121,18 @@ class ServicesStatsQuery
     projects_full
   end
 
-  def call_ruby_gpt
-    projects_full = []
-    projects_empty = []
-
-    # Use includes to avoid N+1 query problem
-    services = Service.includes(category: [:parent])
-                      .where(user: user, status: "approved", active: true)
-                      .order(category_id: :asc)
-
-    # Preload ratings and group them by project_id
-    ratings = Rating.includes(:project)
-                    .where(reviewee: user)
-                    .group_by(&:project_id)
-
-    services.each do |service|
-      ratings_count = 0
-      ratings_total = 0
-
-      # Use preloaded ratings instead of querying them for each service
-      service_ratings = ratings.select do |project_id, project_ratings|
-        project_ratings.first.project.category_id == service.category_id
-      end
-
-      service_ratings.each do |_project_id, project_ratings|
-        project_ratings.each do |rating|
-          ratings_count += 1
-          ratings_total += rating.rating
-        end
-      end
-
-      ratings_average = (ratings_total / ratings_count.to_f).round(1).to_s if ratings_count != 0 && ratings_total != 0
-
-      completed_projects_count = Project.where(vendor: user, status: "Complete", category_id: service.category_id).size
-
-      service_hash = {
-        categoryId: service.category_id,
-        categoryName: service.category.parent.name,
-        subcategoryName: service.category.name,
-        completedProjectsCount: completed_projects_count,
-        ratingsCount: ratings_count,
-        ratingsAverage: ratings_average,
-      }
-
-      if completed_projects_count > 0
-        projects_full.push(service_hash)
-      else
-        projects_empty.push(service_hash)
-      end
-    end
-
-    projects_full.sort_by! { |k| -k[:completedProjectsCount] }
-    projects_full.push(*projects_empty)
-
-    projects_full
-  end
-
-  def call_sql_gpt
-    sql_query = <<-SQL
-      SELECT
-        c1.id AS category_id,
-        c2.name AS category_name,
-        c1.name AS subcategory_name,
-        COUNT(DISTINCT p.id) FILTER (WHERE p.status = 'Complete') AS completed_projects_count,
-        COUNT(r.id) AS ratings_count,
-        COALESCE(AVG(r.rating), 0) AS ratings_average
-      FROM
-        services s
-        JOIN categories c1 ON s.category_id = c1.id
-        JOIN categories c2 ON c1.parent_id = c2.id
-        LEFT JOIN projects p ON s.user_id = p.vendor_id AND p.category_id = c1.id
-        LEFT JOIN ratings r ON s.user_id = r.reviewee_id AND p.id = r.project_id
-      WHERE
-        s.user_id = :user_id AND s.status = 'approved' AND s.active = true
-      GROUP BY
-        c1.id, c2.name, c1.name
-      ORDER BY
-        completed_projects_count DESC, c1.id ASC;
-    SQL
-
-    sql = ActiveRecord::Base.sanitize_sql_array([sql_query, user_id: user.id])
-    result = ActiveRecord::Base.connection.execute(sql).to_a
-
-
-    projects_full = []
-    projects_empty = []
-
-    result.each do |row|
-      service_hash = row.symbolize_keys
-
-      if service_hash[:completed_projects_count] > 0
-        projects_full.push(service_hash)
-      else
-        projects_empty.push(service_hash)
-      end
-    end
-
-    projects_full.concat(projects_empty)
-  end
-
   def call_sql
     sql = ActiveRecord::Base.sanitize_sql_array([SQL, user_id: user.id])
     ActiveRecord::Base.connection.execute(sql).to_a
   end
 
-  def call_sql2
-    sql = ActiveRecord::Base.sanitize_sql_array([SQL2, user_id: user.id])
+  def call_sql_gpt
+    sql = ActiveRecord::Base.sanitize_sql_array([SQL_GPT, user_id: user.id])
     ActiveRecord::Base.connection.execute(sql).to_a
   end
 
-  def call_sql3
-    sql = ActiveRecord::Base.sanitize_sql_array([SQL3, userId: user.id])
+  def call_sql_gpt_new
+    sql = ActiveRecord::Base.sanitize_sql_array([SQL_GPT_NEW, user_id: user.id])
     ActiveRecord::Base.connection.execute(sql).to_a
   end
 end
